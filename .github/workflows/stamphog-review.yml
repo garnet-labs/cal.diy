@@ -1,0 +1,133 @@
+# Only garnet-record.yml records the workload. Recording this evidence consumer
+# would feed its own runtime comment back into the issue_comment trigger.
+name: Stamphog Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: string
+      dry_run:
+        description: "Gates only (skip LLM)"
+        required: false
+        type: boolean
+        default: false
+  pull_request:
+    types: [labeled, ready_for_review, synchronize]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: stamphog-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: "Stamphog verdict"
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (
+        github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
+        && !github.event.pull_request.draft
+        && github.event.pull_request.user.type != 'Bot'
+        && !contains(github.event.pull_request.user.login, '[bot]')
+        && (
+          github.event.label.name == 'stamphog'
+          || (github.event.action == 'ready_for_review' && contains(github.event.pull_request.labels.*.name, 'stamphog'))
+          || (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'stamphog'))
+        )
+      )
+      || (
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && github.event.comment.user.login == 'garnet-runtime-review[bot]'
+        && contains(github.event.comment.body, 'garnet:summary')
+        && contains(github.event.issue.labels.*.name, 'stamphog')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout main (trusted gate source)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve PR number
+        id: pr
+        run: echo "number=${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Require finalized current-head evidence
+        id: evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUIRE_LABEL: ${{ github.event_name != 'workflow_dispatch' }}
+        run: |
+          python3 .github/scripts/stamphog-ready.py \
+            "${{ github.repository }}" "${{ steps.pr.outputs.number }}"
+
+      - name: Install uv
+        if: steps.evidence.outputs.ready == 'true'
+        uses: astral-sh/setup-uv@v5
+
+      - name: Fetch PR head
+        if: steps.evidence.outputs.ready == 'true'
+        run: git fetch origin "pull/${{ steps.pr.outputs.number }}/head"
+
+      - name: Run stamphog engine
+        if: steps.evidence.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}/tools/owners
+          NO_COLOR: "1"
+          TERM: dumb
+        run: |
+          set -o pipefail
+          EXTRA=""
+          if [ -z "${ANTHROPIC_API_KEY:-}" ] || [ "${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && 'true' || 'false' }}" = "true" ]; then
+            EXTRA="--dry-run"
+            echo "Running in deterministic-gate mode (--dry-run)."
+          fi
+          uv run tools/pr-approval-agent/review_pr.py "${{ steps.pr.outputs.number }}" \
+            --repo "${{ github.repository }}" \
+            $EXTRA \
+            --output-json "verdict-${{ steps.pr.outputs.number }}.json" | tee review-output.txt
+          {
+            echo '## Stamphog verdict for PR #${{ steps.pr.outputs.number }}'
+            echo '```'
+            cat review-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish review-status comment
+        if: always() && steps.evidence.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f "verdict-${{ steps.pr.outputs.number }}.json" ]; then
+            echo "no verdict JSON — engine exited before writing; see the run log"
+            exit 0
+          fi
+          python3 .github/scripts/stamphog-publish.py \
+            "verdict-${{ steps.pr.outputs.number }}.json" \
+            "${{ github.repository }}" \
+            "${{ steps.pr.outputs.number }}"
+
+      - name: Upload verdict bundle
+        if: always() && steps.evidence.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stamphog-verdict-pr${{ steps.pr.outputs.number }}
+          path: |
+            verdict-${{ steps.pr.outputs.number }}.json
+            review-output.txt
